@@ -1,5 +1,7 @@
 # OTel Sonifier
 
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+
 A concept extension for the OpenTelemetry Collector that implements monitoring based on Calm Technology principles. Instead of traditional dashboards and alerts, OTel Sonifier creates a peripheral awareness system using rain and sky hue shifts that respond to telemetry in the background of our attention.
 
 <a href="https://www.youtube.com/watch?v=q3H-TQLEKnw" target="_blank"><img width="1098" height="681" alt="sonifier" src="https://github.com/user-attachments/assets/965d5335-8ae5-4bf7-99ef-621a746e3ae4" /></a>
