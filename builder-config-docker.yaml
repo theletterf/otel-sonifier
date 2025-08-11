@@ -1,0 +1,28 @@
+dist:
+  name: otelcol-sonifier
+  description: "OpenTelemetry Collector with Sonifier Extension"
+  output_path: /build/otelcol-sonifier
+  go: go
+
+replaces:
+  - github.com/gemini/sonifierextension => /build/sonifierextension
+
+extensions:
+  - gomod: github.com/gemini/sonifierextension
+
+exporters:
+  - gomod: go.opentelemetry.io/collector/exporter/otlphttpexporter v0.129.0
+  - gomod: go.opentelemetry.io/collector/exporter/debugexporter v0.129.0
+
+processors:
+  - gomod: go.opentelemetry.io/collector/processor/batchprocessor v0.129.0
+
+receivers:
+  - gomod: go.opentelemetry.io/collector/receiver/otlpreceiver v0.129.0
+
+providers:
+  - gomod: go.opentelemetry.io/collector/confmap/provider/envprovider v1.35.0
+  - gomod: go.opentelemetry.io/collector/confmap/provider/fileprovider v1.35.0
+  - gomod: go.opentelemetry.io/collector/confmap/provider/httpprovider v1.35.0
+  - gomod: go.opentelemetry.io/collector/confmap/provider/httpsprovider v1.35.0
+  - gomod: go.opentelemetry.io/collector/confmap/provider/yamlprovider v1.35.0

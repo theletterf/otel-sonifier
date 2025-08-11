@@ -1,0 +1,44 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+
+exporters:
+  otlphttp:
+    endpoint: http://localhost:44444
+    encoding: json
+    compression: none
+    timeout: 100ms
+    sending_queue:
+      enabled: false
+    retry_on_failure:
+      enabled: false
+    tls:
+      insecure: true
+  debug:
+    verbosity: detailed
+
+extensions:
+  sonifier:
+    endpoint: "localhost:44444"
+
+service:
+  extensions: [sonifier]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: []
+      exporters: [otlphttp, debug]
+    metrics:
+      receivers: [otlp]
+      processors: []
+      exporters: [otlphttp, debug]
+    logs:
+      receivers: [otlp]
+      processors: []
+      exporters: [otlphttp, debug]
