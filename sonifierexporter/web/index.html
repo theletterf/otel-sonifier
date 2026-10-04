@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OpenTelemetry Sonifier</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Arial', sans-serif;
+            overflow: hidden;
+            background: #000;
+        }
+
+        #visualization {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+        }
+        
+        .sky-layer {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            opacity: 0;
+            transition: opacity 4s ease-in-out;
+        }
+        
+        .sky-layer.active {
+            opacity: 1;
+        }
+        
+        .sky-low {
+            background: linear-gradient(135deg, #1a1a3e 0%, #0f0f2a 100%);
+        }
+        
+        .sky-medium {
+            background: linear-gradient(135deg, #2d1b69 0%, #1a0d3d 100%);
+        }
+        
+        .sky-high {
+            background: linear-gradient(135deg, #4a1a3e 0%, #2d0f2a 100%);
+        }
+        
+        .sky-stress {
+            background: linear-gradient(135deg, #6b2737 0%, #3d1520 100%);
+        }
+
+        #controls {
+            position: fixed;
+            top: 20px;
+            left: 20px;
+            z-index: 100;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 15px;
+            border-radius: 10px;
+            color: white;
+            font-size: 14px;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        #controls label {
+            display: block;
+            margin-bottom: 8px;
+            cursor: pointer;
+        }
+
+        #controls input[type="checkbox"] {
+            margin-right: 8px;
+        }
+
+        #debug-link {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            z-index: 100;
+            color: rgba(255, 255, 255, 0.5);
+            text-decoration: none;
+            font-size: 12px;
+            background: rgba(0, 0, 0, 0.5);
+            padding: 8px 12px;
+            border-radius: 5px;
+            backdrop-filter: blur(5px);
+        }
+
+        #debug-link:hover {
+            color: rgba(255, 255, 255, 0.8);
+        }
+
+        .raindrop {
+            position: absolute;
+            pointer-events: none;
+            font-family: 'Courier New', monospace;
+            font-size: 11px;
+            font-weight: bold;
+            color: rgba(135, 206, 250, 0.8);
+            text-shadow: 0 0 3px rgba(135, 206, 250, 0.5);
+            line-height: 1;
+            transform-origin: center;
+        }
+
+        .raindrop.error {
+            color: rgba(255, 182, 193, 0.8);
+            text-shadow: 0 0 3px rgba(255, 182, 193, 0.5);
+        }
+
+        .raindrop-char {
+            display: block;
+            margin: 0;
+            opacity: 0.9;
+        }
+
+        .error-bloom {
+            position: absolute;
+            width: 20px;
+            height: 20px;
+            background: radial-gradient(circle, rgba(255, 100, 100, 0.8), rgba(255, 200, 100, 0.4), transparent);
+            border-radius: 50%;
+            pointer-events: none;
+            animation: bloom 1s ease-out forwards;
+        }
+
+        @keyframes bloom {
+            0% {
+                transform: scale(0);
+                opacity: 1;
+            }
+            100% {
+                transform: scale(3);
+                opacity: 0;
+            }
+        }
+
+        .raindrop-fall {
+            animation: raindropFall 3s linear forwards;
+        }
+
+        @keyframes raindropFall {
+            0% {
+                opacity: 0.9;
+                transform: translateY(0);
+            }
+            70% {
+                opacity: 0.9;
+            }
+            100% {
+                opacity: 0;
+                transform: translateY(100vh);
+            }
+        }
+
+        .ground-splash {
+            animation: groundSplash 0.5s ease-out forwards;
+        }
+
+        @keyframes groundSplash {
+            0% {
+                opacity: 0.8;
+                transform: scale(0.5) translateY(0);
+            }
+            50% {
+                opacity: 0.4;
+                transform: scale(1.2) translateY(-10px);
+            }
+            100% {
+                opacity: 0;
+                transform: scale(1.5) translateY(-20px);
+            }
+        }
+    </style>
+</head>
+<body>
+    <div id="visualization">
+        <div class="sky-layer sky-low active" id="sky-low"></div>
+        <div class="sky-layer sky-medium" id="sky-medium"></div>
+        <div class="sky-layer sky-high" id="sky-high"></div>
+        <div class="sky-layer sky-stress" id="sky-stress"></div>
+    </div>
+    
+    <div id="controls">
+        <label>
+            <input type="checkbox" id="audio-enabled" />
+            Enable Audio
+        </label>
+        <div id="activity-level">Activity: <span id="activity-value">0%</span></div>
+    </div>
+
+    <a href="/debug" id="debug-link">Debug View</a>
+
+    <script type="module" src="script.js"></script>
+</body>
+</html>
