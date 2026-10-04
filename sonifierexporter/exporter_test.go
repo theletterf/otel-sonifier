@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -26,6 +27,8 @@ func startAll(t *testing.T) (*hub, exporter.Traces, exporter.Metrics, exporter.L
 	f := NewFactory()
 	cfg := f.CreateDefaultConfig().(*Config)
 	cfg.NetAddr.Endpoint = "127.0.0.1:0"
+	cfg.TickInterval = 20 * time.Millisecond
+	cfg.FastWindow = 100 * time.Millisecond
 	require.NoError(t, cfg.Validate())
 
 	ctx := context.Background()
@@ -90,63 +93,78 @@ func TestSharedServerServesUI(t *testing.T) {
 	assert.Contains(t, string(body), "script.js")
 }
 
-func TestBroadcastsAllSignals(t *testing.T) {
+// readWeather reads weather messages until one satisfies ok.
+func readWeather(t *testing.T, conn *websocket.Conn, ok func(Weather) bool) Weather {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		env := readEnvelope(t, conn)
+		require.Equal(t, "weather", env.Type)
+		var st Weather
+		require.NoError(t, json.Unmarshal(env.Payload, &st))
+		if ok(st) {
+			return st
+		}
+	}
+	t.Fatal("no matching weather message")
+	return Weather{}
+}
+
+func TestSendsWeatherFromAllSignals(t *testing.T) {
 	h, te, me, le := startAll(t)
 	conn := dial(t, h)
 	ctx := context.Background()
 
 	td := ptrace.NewTraces()
-	span := td.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty().Spans().AppendEmpty()
+	rs := td.ResourceSpans().AppendEmpty()
+	rs.Resource().Attributes().PutStr("service.name", "checkout")
+	span := rs.ScopeSpans().AppendEmpty().Spans().AppendEmpty()
 	span.SetTraceID([16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16})
-	span.SetName("checkout")
 	span.Status().SetCode(ptrace.StatusCodeError)
 	require.NoError(t, te.ConsumeTraces(ctx, td))
-
-	env := readEnvelope(t, conn)
-	assert.Equal(t, "traces", env.Type)
-	gotTraces, err := (&ptrace.JSONUnmarshaler{}).UnmarshalTraces(env.Payload)
-	require.NoError(t, err)
-	gotSpan := gotTraces.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0)
-	assert.Equal(t, "checkout", gotSpan.Name())
-	assert.Equal(t, ptrace.StatusCodeError, gotSpan.Status().Code())
 
 	md := pmetric.NewMetrics()
 	g := md.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
 	g.SetName("system.cpu.utilization")
 	g.SetEmptyGauge().DataPoints().AppendEmpty().SetDoubleValue(0.3)
 	require.NoError(t, me.ConsumeMetrics(ctx, md))
-	env = readEnvelope(t, conn)
-	assert.Equal(t, "metrics", env.Type)
-	assert.Contains(t, string(env.Payload), "system.cpu.utilization")
 
 	ld := plog.NewLogs()
-	ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty().SetSeverityText("ERROR")
+	ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty().SetSeverityNumber(plog.SeverityNumberError)
 	require.NoError(t, le.ConsumeLogs(ctx, ld))
-	env = readEnvelope(t, conn)
-	assert.Equal(t, "logs", env.Type)
-	assert.Contains(t, string(env.Payload), "ERROR")
+
+	st := readWeather(t, conn, func(st Weather) bool { return len(st.Drops) > 0 })
+	assert.Equal(t, []Drop{{TraceID: "0102030405060708090a0b0c0d0e0f10", Error: true, Service: "checkout"}}, st.Drops)
+	assert.Equal(t, 1.0, st.ErrorRate)
+	assert.Positive(t, st.Logs.Error)
+	require.NotNil(t, st.Host)
+	assert.Equal(t, 0.3, st.Host.CPU)
+
+	resp, err := http.Get("http://" + h.addr.String() + "/debug")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	var debug Weather
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&debug))
 }
 
-func TestSlowClientDoesNotBlockPipeline(t *testing.T) {
-	h, te, _, _ := startAll(t)
+func TestSlowClientDoesNotBlockBroadcast(t *testing.T) {
+	h, _, _, _ := startAll(t)
 	_ = dial(t, h) // connected but never reads
 
-	td := ptrace.NewTraces()
-	spans := td.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty().Spans()
-	for range 500 {
-		spans.AppendEmpty().SetName("padding-to-fill-socket-buffers")
-	}
+	payload, err := json.Marshal(strings.Repeat("x", 100_000))
+	require.NoError(t, err)
 
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		for range 2000 {
-			_ = te.ConsumeTraces(context.Background(), td)
+			_ = h.broadcast("weather", payload)
 		}
 	}()
 	select {
 	case <-done:
 	case <-time.After(10 * time.Second):
-		t.Fatal("ConsumeTraces blocked on a client that is not reading")
+		t.Fatal("broadcast blocked on a client that is not reading")
 	}
 }

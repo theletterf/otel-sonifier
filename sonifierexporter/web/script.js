@@ -1,26 +1,18 @@
 import { RainEngine } from './rain-engine.js';
-import { TelemetryAnalyzer } from './telemetry-analyzer.js';
 import { SoundscapeEngine } from './soundscape-engine.js';
 
 class TelemetryVisualizer {
     constructor() {
         this.rainEngine = new RainEngine();
         this.soundscapeEngine = new SoundscapeEngine();
-        this.telemetryAnalyzer = new TelemetryAnalyzer();
         this.isAudioEnabled = false;
         this.currentActivity = 0;
         this.raindrops = [];
         this.errorBlooms = [];
 
-        // Constant rain system
-        this.traceQueue = [];
-        this.basePlaybackRate = 20; // Base: 20ms between drops (50/sec)
-        this.currentPlaybackRate = this.basePlaybackRate;
-        this.lastTraceCount = 0;
-
-        // Target metric level tracking
-        this.targetMetricLevel = 0;
-        this.currentSkyId = 'sky-low';
+        // Sky layers, from calm to stormy, crossfaded by mood
+        this.skyLayers = ['sky-low', 'sky-medium', 'sky-high', 'sky-stress']
+            .map(id => document.getElementById(id));
 
         // Combined activity level for soundscape (decays toward 0 when no data)
         this.rawActivityLevel = 0;
@@ -29,7 +21,6 @@ class TelemetryVisualizer {
         this.initializeUI();
         this.startDataFetching();
         this.setupAnimationLoop();
-        this.startConstantRain();
         this.startSoundscapeDecay();
     }
 
@@ -139,9 +130,8 @@ class TelemetryVisualizer {
             ws.onmessage = (event) => {
                 try {
                     const data = JSON.parse(event.data);
-                    if (data.payload) {
-                        const analyzedTelemetry = this.telemetryAnalyzer.analyzeTelemetry(data.payload);
-                        this.updateVisualization(analyzedTelemetry, data.type);
+                    if (data.type === 'weather') {
+                        this.applyWeather(data.payload);
                     }
                 } catch (error) {
                     console.error('Error processing WebSocket data:', error);
@@ -162,119 +152,62 @@ class TelemetryVisualizer {
         connectWebSocket();
     }
 
-    updateVisualization(telemetry, dataType) {
-        // Calculate individual activities
-        const traceActivity = Math.min(telemetry.traces.count / 10, 1); // More sensitive to traces
-        const metricActivity = Math.max(
-            telemetry.metrics.cpu / 100,
-            telemetry.metrics.memory / 100,
-            telemetry.metrics.disk / 100
-        );
-        const logActivity = Math.min(telemetry.logs.totalCount / 10, 1); // Count total logs, not just errors
-        
-        // Update current activity — tracks new data quickly, decays when idle
-        const newActivity = Math.max(traceActivity, metricActivity, logActivity);
-        if (newActivity >= this.currentActivity) {
-            // Jump up immediately to new highs
-            this.currentActivity = newActivity;
-        } else {
-            // Gentle decay when activity drops (0.9 per update instead of 0.95)
-            this.currentActivity = Math.max(this.currentActivity * 0.9, newActivity);
-        }
+    // Weather arrives every tick (200ms by default). The server has already
+    // compared current conditions with the baseline; mood is 0 (calm) to 1
+    // (stormy).
+    applyWeather(weather) {
+        this.currentActivity = weather.mood;
 
-        // Feed combined activity to soundscape (all signals)
-        this.rawActivityLevel = this.currentActivity;
+        // Feed mood to the soundscape
+        this.rawActivityLevel = weather.mood;
         this.lastActivityTime = Date.now();
-        this.soundscapeEngine.updateFromTelemetry(this.currentActivity);
+        this.soundscapeEngine.updateFromTelemetry(weather.mood);
 
-        // Sky gradient driven by metrics (discrete levels)
-        if (dataType === 'metrics' && metricActivity > 0) {
-            let detectedLevel;
-            if (metricActivity < 0.2) {
-                detectedLevel = 0.1;
-            } else if (metricActivity < 0.45) {
-                detectedLevel = 0.3;
-            } else if (metricActivity < 0.8) {
-                detectedLevel = 0.6;
-            } else {
-                detectedLevel = 1.0;
-            }
-            if (detectedLevel !== this.targetMetricLevel) {
-                this.targetMetricLevel = detectedLevel;
-                this.updateSkyGradient(this.targetMetricLevel);
-            }
+        this.setSky(weather.mood);
+
+        document.getElementById('activity-value').textContent =
+            `${Math.round(weather.mood * 100)}%`;
+        document.getElementById('weather-stats').textContent = this.describe(weather);
+
+        // Spread this tick's drops across the tick so the rain is even
+        for (const drop of weather.drops) {
+            setTimeout(() => this.createRaindrop(drop), Math.random() * weather.tickMs);
         }
-        
-        // Update activity display
-        document.getElementById('activity-value').textContent = 
-            `${Math.round(this.currentActivity * 100)}%`;
-        
-        // Update audio - rain engine handles its own activity updates
-        
-        // Buffer incoming traces for constant rain playback
-        if (dataType === 'traces' && telemetry.traces.count > 0 && telemetry.traces.traceIds) {
-            // Add all new traces to the queue
-            telemetry.traces.traceIds.forEach(trace => {
-                this.traceQueue.push(trace);
-            });
-            
-            // Store current trace count for rate adjustment
-            this.lastTraceCount = telemetry.traces.count;
-            
-            // Adjust playback rate based on queue length to prevent overflow/underflow
-            this.adjustPlaybackRate();
-            
-            console.log(`Buffered ${telemetry.traces.count} traces. Queue: ${this.traceQueue.length}, Rate: ${this.currentPlaybackRate}ms`);
-        }
-        
-        // Create error blooms for high error rates
-        if (telemetry.traces.errorRate > 0.3 || telemetry.logs.errorRate > 0.5) {
+
+        // Error blooms, more often the worse errors get (at most a few per second)
+        if (weather.scores.errors > 0.5 && Math.random() < weather.scores.errors * 0.5) {
             this.createErrorBloom();
         }
     }
 
-    updateSkyGradient(targetLevel) {
-        // Map target levels to sky layer IDs
-        let targetSkyId;
-        
-        if (targetLevel <= 0.1) {
-            targetSkyId = 'sky-low';
-        } else if (targetLevel <= 0.3) {
-            targetSkyId = 'sky-medium';
-        } else if (targetLevel <= 0.6) {
-            targetSkyId = 'sky-high';
-        } else {
-            targetSkyId = 'sky-stress';
-        }
-        
-        // Only update if sky level has actually changed
-        if (targetSkyId !== this.currentSkyId) {
-            console.log(`Sky transition: level ${targetLevel} -> ${targetSkyId}`);
-            
-            // Fade out all sky layers
-            const allLayers = document.querySelectorAll('.sky-layer');
-            allLayers.forEach(layer => layer.classList.remove('active'));
-            
-            // Fade in the target sky layer
-            const targetLayer = document.getElementById(targetSkyId);
-            if (targetLayer) {
-                targetLayer.classList.add('active');
-            }
-            
-            this.currentSkyId = targetSkyId;
-        }
+    describe(weather) {
+        if (weather.rate === 0) return 'No requests';
+        const rate = weather.rate < 10 ? weather.rate.toFixed(1) : Math.round(weather.rate);
+        const errors = `${Math.round(weather.errorRate * 100)}% errors`;
+        const p95 = weather.p95 > 0 ? ` · p95 ${Math.round(weather.p95)}ms` : '';
+        return `${rate} req/s · ${errors}${p95}`;
     }
 
+    // Crossfade the sky layers: each layer is fully visible at its own point
+    // on the mood scale and fades out toward its neighbours. The CSS opacity
+    // transition smooths changes between ticks.
+    setSky(mood) {
+        const last = this.skyLayers.length - 1;
+        this.skyLayers.forEach((layer, i) => {
+            layer.style.opacity = Math.max(0, 1 - Math.abs(mood * last - i));
+        });
+    }
 
-    createRaindrop(trace) {
+    createRaindrop(drop) {
         const visualization = document.getElementById('visualization');
         
         // Create raindrop made of trace ID characters
         const raindrop = document.createElement('div');
-        raindrop.className = `raindrop ${trace.isError ? 'error' : ''}`;
-        
+        raindrop.className = `raindrop ${drop.error ? 'error' : ''}`;
+        raindrop.title = `${drop.service} · ${drop.id}`;
+
         // Use the trace ID characters
-        const traceId = trace.id || trace.shortId;
+        const traceId = drop.id;
         
         // Create individual character elements arranged vertically
         for (let i = 0; i < Math.min(traceId.length, 12); i++) { // Limit to 12 chars for raindrop
@@ -367,47 +300,6 @@ class TelemetryVisualizer {
         }, 1000);
     }
 
-
-    adjustPlaybackRate() {
-        const queueLength = this.traceQueue.length;
-        
-        // Adjust rate based on queue length to handle high-volume stress testing
-        if (queueLength > 200) {
-            // Very large queue - maximum speed
-            this.currentPlaybackRate = 1; // 1ms = 1000 drops/sec
-        } else if (queueLength > 100) {
-            // Large queue - very fast playback
-            this.currentPlaybackRate = 2; // 2ms = 500 drops/sec
-        } else if (queueLength > 50) {
-            // Queue getting full - fast playback
-            this.currentPlaybackRate = 5; // 5ms = 200 drops/sec
-        } else if (queueLength > 20) {
-            // Moderate queue - speed up
-            this.currentPlaybackRate = 10; // 10ms = 100 drops/sec
-        } else if (queueLength < 5) {
-            // Queue getting empty - slow down to preserve traces
-            this.currentPlaybackRate = this.basePlaybackRate * 2;
-        } else {
-            // Normal queue - base rate
-            this.currentPlaybackRate = this.basePlaybackRate;
-        }
-    }
-
-    startConstantRain() {
-        // Constant rain timer - plays buffered traces at steady rate
-        const playNextTrace = () => {
-            if (this.traceQueue.length > 0) {
-                const trace = this.traceQueue.shift();
-                this.createRaindrop(trace);
-            }
-            
-            // Schedule next raindrop
-            setTimeout(playNextTrace, this.currentPlaybackRate);
-        };
-        
-        // Start the constant rain
-        playNextTrace();
-    }
 
     startSoundscapeDecay() {
         // When no telemetry arrives for 3s, decay toward 0

@@ -3,6 +3,7 @@ package sonifierexporter
 import (
 	"context"
 	"sync"
+	"time"
 
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/config/confighttp"
@@ -33,7 +34,11 @@ func createDefaultConfig() component.Config {
 	server.NetAddr.Endpoint = "localhost:44444"
 	return &Config{
 		ServerConfig:     server,
-		ClientBufferSize: 256,
+		ClientBufferSize: 64,
+		TickInterval:     200 * time.Millisecond,
+		FastWindow:       2 * time.Second,
+		BaselineWindow:   5 * time.Minute,
+		MaxDropsPerTick:  40,
 	}
 }
 

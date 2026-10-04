@@ -1,6 +1,7 @@
 package sonifierexporter
 
 import (
+	"bytes"
 	"context"
 	"embed"
 	"encoding/json"
@@ -9,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -24,9 +26,9 @@ var webFiles embed.FS
 
 const writeTimeout = 5 * time.Second
 
-// hub serves the web UI and fans telemetry out to every connected browser.
-// One hub is shared by the traces, metrics, and logs exporters of a single
-// sonifier config.
+// hub serves the web UI, aggregates telemetry into weather, and sends a weather
+// update to every connected browser on each tick. One hub is shared by the
+// traces, metrics, and logs exporters of a single sonifier config.
 type hub struct {
 	cfg      *Config
 	settings component.TelemetrySettings
@@ -37,15 +39,16 @@ type hub struct {
 	server      *http.Server
 	addr        net.Addr
 	serveDone   chan struct{}
+	stopTicking chan struct{}
+	tickDone    chan struct{}
+
+	weather *weather
+	latest  atomic.Pointer[[]byte] // last weather message, for /debug
 
 	upgrader websocket.Upgrader
 
 	clientsMu sync.Mutex
 	clients   map[*client]struct{}
-
-	tracesMarshaler  ptrace.JSONMarshaler
-	metricsMarshaler pmetric.JSONMarshaler
-	logsMarshaler    plog.JSONMarshaler
 }
 
 type client struct {
@@ -53,8 +56,8 @@ type client struct {
 	send chan []byte
 }
 
-// envelope is the message format the web UI expects: the signal type plus the
-// OTLP/JSON payload.
+// envelope is the message format the web UI expects: a message type plus its
+// payload.
 type envelope struct {
 	Type    string          `json:"type"`
 	Payload json.RawMessage `json:"payload"`
@@ -66,6 +69,7 @@ func newHub(cfg *Config, settings component.TelemetrySettings, release func()) *
 		settings: settings,
 		release:  release,
 		clients:  map[*client]struct{}{},
+		weather:  newWeather(cfg),
 	}
 }
 
@@ -87,6 +91,7 @@ func (h *hub) Start(ctx context.Context, host component.Host) error {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", h.handleWebSocket)
+	mux.HandleFunc("/debug", h.handleDebug)
 	mux.Handle("/", http.FileServer(http.FS(webFS)))
 
 	ln, err := h.cfg.ToListener(ctx)
@@ -105,6 +110,10 @@ func (h *hub) Start(ctx context.Context, host component.Host) error {
 	h.serveDone = make(chan struct{})
 
 	h.settings.Logger.Info("Sonifier web UI listening", zap.String("address", "http://"+h.addr.String()))
+
+	h.stopTicking = make(chan struct{})
+	h.tickDone = make(chan struct{})
+	go h.tickLoop()
 
 	go func() {
 		defer close(h.serveDone)
@@ -129,6 +138,9 @@ func (h *hub) Shutdown(ctx context.Context) error {
 	}
 	h.release()
 
+	close(h.stopTicking)
+	<-h.tickDone
+
 	// http.Server.Shutdown does not close hijacked WebSocket connections.
 	h.clientsMu.Lock()
 	for c := range h.clients {
@@ -142,34 +154,66 @@ func (h *hub) Shutdown(ctx context.Context) error {
 }
 
 func (h *hub) pushTraces(_ context.Context, td ptrace.Traces) error {
-	payload, err := h.tracesMarshaler.MarshalTraces(td)
-	if err != nil {
-		return err
-	}
-	return h.broadcast("traces", payload)
+	h.weather.addTraces(td)
+	return nil
 }
 
 func (h *hub) pushMetrics(_ context.Context, md pmetric.Metrics) error {
-	payload, err := h.metricsMarshaler.MarshalMetrics(md)
-	if err != nil {
-		return err
-	}
-	return h.broadcast("metrics", payload)
+	h.weather.addMetrics(md, time.Now())
+	return nil
 }
 
 func (h *hub) pushLogs(_ context.Context, ld plog.Logs) error {
-	payload, err := h.logsMarshaler.MarshalLogs(ld)
-	if err != nil {
-		return err
+	h.weather.addLogs(ld)
+	return nil
+}
+
+// tickLoop sends a weather update every tick. It runs even with no browser
+// connected, so the baseline keeps learning.
+func (h *hub) tickLoop() {
+	defer close(h.tickDone)
+	ticker := time.NewTicker(h.cfg.TickInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-h.stopTicking:
+			return
+		case now := <-ticker.C:
+			h.sendWeather(h.weather.advance(now))
+		}
 	}
-	return h.broadcast("logs", payload)
+}
+
+func (h *hub) sendWeather(st Weather) {
+	payload, err := json.Marshal(st)
+	if err != nil {
+		h.settings.Logger.Error("Failed to encode weather", zap.Error(err))
+		return
+	}
+	h.latest.Store(&payload)
+	if err := h.broadcast("weather", payload); err != nil {
+		h.settings.Logger.Error("Failed to broadcast weather", zap.Error(err))
+	}
+}
+
+// handleDebug shows the latest weather update.
+func (h *hub) handleDebug(w http.ResponseWriter, _ *http.Request) {
+	payload := h.latest.Load()
+	if payload == nil {
+		http.Error(w, "no weather yet", http.StatusServiceUnavailable)
+		return
+	}
+	var pretty bytes.Buffer
+	_ = json.Indent(&pretty, *payload, "", "  ")
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write(pretty.Bytes())
 }
 
 // broadcast queues a message for every client without blocking. A client whose
 // buffer is full misses the message: the UI is ambient, so dropping data for
 // a slow tab is better than applying backpressure to the pipeline.
-func (h *hub) broadcast(signal string, payload []byte) error {
-	msg, err := json.Marshal(envelope{Type: signal, Payload: payload})
+func (h *hub) broadcast(msgType string, payload []byte) error {
+	msg, err := json.Marshal(envelope{Type: msgType, Payload: payload})
 	if err != nil {
 		return err
 	}
@@ -180,7 +224,7 @@ func (h *hub) broadcast(signal string, payload []byte) error {
 		select {
 		case c.send <- msg:
 		default:
-			h.settings.Logger.Debug("Dropping message for slow WebSocket client", zap.String("signal", signal))
+			h.settings.Logger.Debug("Dropping message for slow WebSocket client", zap.String("type", msgType))
 		}
 	}
 	return nil

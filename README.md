@@ -12,9 +12,24 @@ The goal is to make monitoring feel as natural as checking the weather: somethin
 
 OTel Sonifier embodies the principles of Calm Technology by making system health visible without demanding focus. Like weather patterns that we notice subconsciously, the exporter transforms telemetry data into environmental changes:
 
-- **Rain patterns** represent trace activity: gentle drizzle for normal operations, intense downpour for high load. Rain drops are trace IDs.
-- **Sky gradients** shift from deep blue (healthy) through purple and red (increasing stress) to orange (critical).
-- **Audio feedback** provides subtle raindrop sounds that sync with trace impacts.
+- **Rain patterns** represent requests: gentle drizzle for light traffic, intense downpour for heavy traffic. Rain drops are trace IDs, red when the request failed.
+- **Sky gradients** shift from deep blue (calm) through purple and red to the darkest storm as conditions get worse than what is normal for your system.
+- **Audio feedback** provides subtle raindrop sounds that sync with trace impacts, and an optional AI-generated soundscape that follows the mood.
+
+## How the weather is computed
+
+The exporter turns telemetry into weather on the collector, and sends the UI a small update five times a second. Open **Debug View** (http://localhost:44444/debug) to see the latest one.
+
+- **Requests** are root spans plus server and consumer spans. For them, the exporter measures rate, error rate, and p50/p95 latency over the last two seconds.
+- **The baseline** is what normal looks like for your system, learned over about five minutes. Load and latency are judged against it, so a busy service that is always busy stays calm, and a sustained change gradually becomes the new normal.
+- **Scores** run from 0 (calm) to 1 (stormy):
+  - *Load*: traffic above baseline (8x is 1).
+  - *Latency*: p95 above baseline (4x is 1).
+  - *Errors*: absolute error rate (31% is 1). Errors are bad even when they are usual.
+  - *Saturation*: `system.cpu.utilization` or `system.memory.utilization` above 70%.
+  - *Quiet*: traffic far below baseline. Silence is worth noticing but is not a storm, so it does not affect the mood.
+- **Mood** is the highest of the scores, smoothed over a few seconds. It drives the sky and the soundscape.
+- **Drops** are a uniform sample of requests, at most 40 per update, so the share of red drops matches the error rate.
 
 The goal is to create a monitoring experience that feels more like observing nature than managing infrastructure.
 
@@ -49,7 +64,7 @@ The collector will start with:
 - Sonifier web UI on http://localhost:44444
 - Real-time raindrop visualization of trace IDs
 - Audio feedback system with ground impact sounds
-- Smooth sky gradient transitions between load levels
+- Smooth sky transitions as conditions change
 
 ## Usage
 
@@ -83,7 +98,11 @@ Sonifier is an exporter. Add it to any pipeline whose data you want to see and h
 exporters:
   sonifier:
     endpoint: localhost:44444  # Web UI and WebSocket stream
-    client_buffer_size: 256    # Messages buffered per browser tab
+    tick_interval: 200ms       # How often the UI gets a weather update
+    fast_window: 2s            # Period current conditions are measured over
+    baseline_window: 5m        # How long until a change becomes the new normal
+    max_drops_per_tick: 40     # Sampled trace IDs per update
+    client_buffer_size: 64     # Updates buffered per browser tab
 
 service:
   pipelines:
@@ -92,7 +111,7 @@ service:
       exporters: [sonifier]
 ```
 
-When you use the same `sonifier` exporter in several pipelines, they share one web server. The exporter never applies backpressure: if a browser tab falls behind, it misses messages, and the pipeline is not slowed down. The `endpoint` setting accepts the usual [confighttp server options](https://github.com/open-telemetry/opentelemetry-collector/tree/main/config/confighttp), such as TLS.
+When you use the same `sonifier` exporter in several pipelines, they share one web server. The exporter never applies backpressure: if a browser tab falls behind, it misses updates, and the pipeline is not slowed down. The `endpoint` setting accepts the usual [confighttp server options](https://github.com/open-telemetry/opentelemetry-collector/tree/main/config/confighttp), such as TLS.
 
 ## File structure
 
@@ -106,12 +125,13 @@ otel-sonifier/
 │   ├── config.go                  # Exporter configuration
 │   ├── factory.go                 # Exporter factory, shared per config
 │   ├── hub.go                     # Web server and WebSocket fan-out
+│   ├── weather.go                 # Turns telemetry into weather
 │   └── web/                       # Web UI and visualization system
 │       ├── index.html             # Main web interface
 │       ├── script.js              # Main visualization logic and controls
 │       ├── style.css              # Styling and UI controls
 │       ├── rain-engine.js         # Simple raindrop sound effects
-│       └── telemetry-analyzer.js  # Telemetry processing for visualization
+│       └── soundscape-engine.js   # Optional AI soundscape (Lyria RealTime)
 ├── otelgen/                       # Load generator
 │   └── main.go                    # Generator implementation
 └── README.md                      # This documentation
