@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -152,7 +153,9 @@ func runGenerator(config Config) error {
 	fmt.Printf("⚠️  Error rate: %.0f%%, High severity: %.0f%%\n", 
 		config.ErrorRate*100, config.HighSeverity*100)
 
-	ctx, cancel := context.WithTimeout(context.Background(), config.Duration)
+	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	ctx, cancel := context.WithTimeout(sigCtx, config.Duration)
 	defer cancel()
 
 	// Create resource
@@ -175,7 +178,6 @@ func runGenerator(config Config) error {
 	if err != nil {
 		return fmt.Errorf("failed to create trace exporter: %w", err)
 	}
-	defer traceExporter.Shutdown(ctx)
 
 	metricExporter, err := otlpmetricgrpc.New(ctx,
 		otlpmetricgrpc.WithEndpoint(config.Endpoint),
@@ -184,7 +186,6 @@ func runGenerator(config Config) error {
 	if err != nil {
 		return fmt.Errorf("failed to create metric exporter: %w", err)
 	}
-	defer metricExporter.Shutdown(ctx)
 
 	logExporter, err := otlploggrpc.New(ctx,
 		otlploggrpc.WithEndpoint(config.Endpoint),
@@ -193,35 +194,11 @@ func runGenerator(config Config) error {
 	if err != nil {
 		return fmt.Errorf("failed to create log exporter: %w", err)
 	}
-	defer logExporter.Shutdown(ctx)
 
-	// Setup providers with immediate export (no batching)
-	tp := sdktrace.NewTracerProvider(
-		sdktrace.WithBatcher(traceExporter,
-			sdktrace.WithBatchTimeout(1*time.Millisecond),  // Export immediately
-			sdktrace.WithMaxExportBatchSize(1),             // One trace at a time
-			sdktrace.WithExportTimeout(100*time.Millisecond),
-		),
-		sdktrace.WithResource(res),
-	)
-	defer tp.Shutdown(ctx)
+	tp, mp, lp := newProviders(res, traceExporter, metricExporter, logExporter, 2*time.Second)
+	defer shutdownProviders(tp, mp, lp)
 	otel.SetTracerProvider(tp)
-
-	mp := sdkmetric.NewMeterProvider(
-		sdkmetric.WithReader(sdkmetric.NewPeriodicReader(
-			metricExporter,
-			sdkmetric.WithInterval(2*time.Second), // Export metrics every 2 seconds
-		)),
-		sdkmetric.WithResource(res),
-	)
-	defer mp.Shutdown(ctx)
 	otel.SetMeterProvider(mp)
-
-	lp := sdklog.NewLoggerProvider(
-		sdklog.WithProcessor(sdklog.NewBatchProcessor(logExporter)),
-		sdklog.WithResource(res),
-	)
-	defer lp.Shutdown(ctx)
 
 	// Create telemetry instruments
 	tracer := otel.Tracer("otelgen")
@@ -236,75 +213,154 @@ func runGenerator(config Config) error {
 
 	// Start generators
 	done := make(chan struct{})
-	
+	start := time.Now()
+
 	// Trace generator
-	go generateTraces(ctx, tracer, config, done)
-	
-	// Metric generator  
+	traces := generateTraces(ctx, tracer,
+		func() time.Duration { return config.TraceRate },
+		func() float64 { return config.ErrorRate })
+
+	// Metric generator
 	go generateMetrics(ctx, cpuGauge, memoryGauge, diskCounter, httpCounter, config, done)
-	
+
 	// Log generator
 	go generateLogs(ctx, logger, config, done)
 
 	<-ctx.Done()
 	close(done)
+	sent := traces.wait()
 
-	fmt.Printf("✅ Activity simulation completed\n")
+	elapsed := time.Since(start)
+	fmt.Printf("✅ Activity simulation completed: %d traces in %v (%.1f/sec)\n",
+		sent, elapsed.Round(time.Second), float64(sent)/elapsed.Seconds())
 	return nil
 }
 
-func generateTraces(ctx context.Context, tracer trace.Tracer, config Config, done <-chan struct{}) {
-	operations := []string{
-		"GET /api/users/{id}",
-		"POST /api/orders", 
-		"GET /api/products",
-		"PUT /api/users/{id}",
-		"DELETE /api/sessions/{id}",
-		"GET /api/health",
-		"POST /api/auth/login",
-		"GET /api/metrics",
-	}
+// newProviders sets up the SDK providers. Spans are exported in batches every
+// 100ms: one RPC per span cannot keep up with the higher load levels.
+func newProviders(res *resource.Resource, te sdktrace.SpanExporter, me sdkmetric.Exporter,
+	le sdklog.Exporter, metricInterval time.Duration) (*sdktrace.TracerProvider, *sdkmetric.MeterProvider, *sdklog.LoggerProvider) {
+	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(te,
+			sdktrace.WithBatchTimeout(100*time.Millisecond),
+			sdktrace.WithMaxQueueSize(20000),
+		),
+		sdktrace.WithResource(res),
+	)
+	mp := sdkmetric.NewMeterProvider(
+		sdkmetric.WithReader(sdkmetric.NewPeriodicReader(me, sdkmetric.WithInterval(metricInterval))),
+		sdkmetric.WithResource(res),
+	)
+	lp := sdklog.NewLoggerProvider(
+		sdklog.WithProcessor(sdklog.NewBatchProcessor(le)),
+		sdklog.WithResource(res),
+	)
+	return tp, mp, lp
+}
 
+// shutdownProviders flushes and stops the providers (and their exporters).
+// It uses a fresh context because the run's context is already done by now.
+func shutdownProviders(tp *sdktrace.TracerProvider, mp *sdkmetric.MeterProvider, lp *sdklog.LoggerProvider) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = tp.Shutdown(ctx)
+	_ = mp.Shutdown(ctx)
+	_ = lp.Shutdown(ctx)
+}
+
+var operations = []string{
+	"GET /api/users/{id}",
+	"POST /api/orders",
+	"GET /api/products",
+	"PUT /api/users/{id}",
+	"DELETE /api/sessions/{id}",
+	"GET /api/health",
+	"POST /api/auth/login",
+	"GET /api/metrics",
+}
+
+// traceRun tracks the simulated requests started by generateTraces.
+type traceRun struct {
+	wg   sync.WaitGroup
+	sent atomic.Int64
+	done chan struct{}
+}
+
+// wait blocks until the generator has stopped and every in-flight request
+// has ended, and returns the number of traces sent.
+func (r *traceRun) wait() int64 {
+	<-r.done
+	r.wg.Wait()
+	return r.sent.Load()
+}
+
+// generateTraces starts simulated requests at an average rate of one per
+// interval() until ctx is done. Each request runs in its own goroutine, so
+// simulated processing time does not limit the rate.
+func generateTraces(ctx context.Context, tracer trace.Tracer, interval func() time.Duration, errorRate func() float64) *traceRun {
+	run := &traceRun{done: make(chan struct{})}
+	go func() {
+		defer close(run.done)
+		pace(ctx, interval, func() {
+			run.wg.Add(1)
+			run.sent.Add(1)
+			go func() {
+				defer run.wg.Done()
+				simulateRequest(tracer, errorRate())
+			}()
+		})
+	}()
+	return run
+}
+
+func simulateRequest(tracer trace.Tracer, errorRate float64) {
+	operation := operations[rand.Intn(len(operations))]
+
+	// Not derived from the run's context, so requests in flight at the end
+	// still finish and get exported.
+	_, span := tracer.Start(context.Background(), operation)
+
+	spaceIdx := strings.Index(operation, " ")
+	failed := rand.Float64() < errorRate
+	span.SetAttributes(
+		attribute.String("http.method", operation[:spaceIdx]),
+		attribute.String("http.route", operation[spaceIdx+1:]),
+		attribute.String("user.id", fmt.Sprintf("user_%d", rand.Intn(1000))),
+		attribute.Int("http.status_code", getStatusCode(failed)),
+	)
+
+	// Simulate processing time
+	time.Sleep(time.Duration(rand.Intn(200)) * time.Millisecond)
+
+	if failed {
+		span.RecordError(fmt.Errorf("%s failed", operation))
+		span.SetStatus(codes.Error, "Request failed")
+	} else {
+		span.SetStatus(codes.Ok, "")
+	}
+	span.End()
+}
+
+// pace calls emit at an average rate of one call per interval() until ctx is
+// done. It wakes every 10ms and emits however many calls are due, so it can
+// reach rates beyond what time.Sleep resolves, and it picks up changes to
+// interval() (as in wave mode) within one tick. Jitter keeps arrivals uneven,
+// like real traffic.
+func pace(ctx context.Context, interval func() time.Duration, emit func()) {
+	const tick = 10 * time.Millisecond
+	ticker := time.NewTicker(tick)
+	defer ticker.Stop()
+
+	due := rand.Float64() // start partway through the first interval
 	for {
 		select {
-		case <-done:
-			return
 		case <-ctx.Done():
 			return
-		default:
-			operation := operations[rand.Intn(len(operations))]
-			
-			_, span := tracer.Start(ctx, operation)
-			
-			// Add attributes based on operation
-			spaceIdx := strings.Index(operation, " ")
-			method := operation[:spaceIdx]
-			route := operation[spaceIdx+1:]
-			
-			span.SetAttributes(
-				attribute.String("http.method", method),
-				attribute.String("http.route", route),
-				attribute.String("user.id", fmt.Sprintf("user_%d", rand.Intn(1000))),
-				attribute.Int("http.status_code", getStatusCode(config.ErrorRate)),
-			)
-			
-			// Simulate processing time
-			processingTime := time.Duration(rand.Intn(200)) * time.Millisecond
-			time.Sleep(processingTime)
-			
-			// Set span status based on error rate
-			if rand.Float64() < config.ErrorRate {
-				span.RecordError(fmt.Errorf("%s failed", operation))
-				span.SetStatus(codes.Error, "Request failed")
-			} else {
-				span.SetStatus(codes.Ok, "")
+		case <-ticker.C:
+			due += float64(tick) / float64(interval()) * (0.5 + rand.Float64())
+			for ; due >= 1; due-- {
+				emit()
 			}
-			
-			span.End()
-			
-			// Random delay before next trace - much more natural
-			randomDelay := time.Duration(rand.Float64() * float64(config.TraceRate) * 2)
-			time.Sleep(randomDelay)
 		}
 	}
 }
@@ -336,7 +392,7 @@ func generateMetrics(ctx context.Context, cpuGauge, memoryGauge metric.Float64Ga
 			httpCounter.Add(ctx, int64(rand.Intn(10)+1),
 				metric.WithAttributes(
 					attribute.String("method", "GET"),
-					attribute.String("status", fmt.Sprintf("%d", getStatusCode(config.ErrorRate)))))
+					attribute.String("status", fmt.Sprintf("%d", getStatusCode(rand.Float64() < config.ErrorRate)))))
 		}
 	}
 }
@@ -430,7 +486,6 @@ func runWaveGenerator() error {
 	if err != nil {
 		return fmt.Errorf("failed to create trace exporter: %w", err)
 	}
-	defer traceExporter.Shutdown(ctx)
 
 	metricExporter, err := otlpmetricgrpc.New(ctx,
 		otlpmetricgrpc.WithEndpoint("localhost:4317"),
@@ -439,7 +494,6 @@ func runWaveGenerator() error {
 	if err != nil {
 		return fmt.Errorf("failed to create metric exporter: %w", err)
 	}
-	defer metricExporter.Shutdown(ctx)
 
 	logExporter, err := otlploggrpc.New(ctx,
 		otlploggrpc.WithEndpoint("localhost:4317"),
@@ -448,34 +502,11 @@ func runWaveGenerator() error {
 	if err != nil {
 		return fmt.Errorf("failed to create log exporter: %w", err)
 	}
-	defer logExporter.Shutdown(ctx)
 
-	tp := sdktrace.NewTracerProvider(
-		sdktrace.WithBatcher(traceExporter,
-			sdktrace.WithBatchTimeout(1*time.Millisecond),
-			sdktrace.WithMaxExportBatchSize(1),
-			sdktrace.WithExportTimeout(100*time.Millisecond),
-		),
-		sdktrace.WithResource(res),
-	)
-	defer tp.Shutdown(ctx)
+	tp, mp, lp := newProviders(res, traceExporter, metricExporter, logExporter, 1*time.Second)
+	defer shutdownProviders(tp, mp, lp)
 	otel.SetTracerProvider(tp)
-
-	mp := sdkmetric.NewMeterProvider(
-		sdkmetric.WithReader(sdkmetric.NewPeriodicReader(
-			metricExporter,
-			sdkmetric.WithInterval(1*time.Second),
-		)),
-		sdkmetric.WithResource(res),
-	)
-	defer mp.Shutdown(ctx)
 	otel.SetMeterProvider(mp)
-
-	lp := sdklog.NewLoggerProvider(
-		sdklog.WithProcessor(sdklog.NewBatchProcessor(logExporter)),
-		sdklog.WithResource(res),
-	)
-	defer lp.Shutdown(ctx)
 
 	tracer := otel.Tracer("otelgen")
 	meter := otel.Meter("otelgen")
@@ -490,8 +521,13 @@ func runWaveGenerator() error {
 
 	done := make(chan struct{})
 
-	// Wave-aware trace generator: rate follows the level
-	go generateWaveTraces(ctx, tracer, done)
+	// Wave-aware trace generator: rate follows the level, from one trace
+	// every 5s at 0% to 1000 traces/sec at 100% (exponential)
+	traces := generateTraces(ctx, tracer,
+		func() time.Duration {
+			return time.Duration(5000 * math.Pow(0.0002, getWaveLevel()) * float64(time.Millisecond))
+		},
+		func() float64 { return 0.02 + getWaveLevel()*0.48 })
 
 	// Wave-aware log generator: rate and severity follow the level
 	go generateWaveLogs(ctx, logger, done)
@@ -503,7 +539,10 @@ func runWaveGenerator() error {
 		select {
 		case <-ctx.Done():
 			close(done)
-			fmt.Println("\nWave stopped")
+			sent := traces.wait()
+			elapsed := time.Since(startTime)
+			fmt.Printf("\nWave stopped: %d traces in %v (%.1f/sec)\n",
+				sent, elapsed.Round(time.Second), float64(sent)/elapsed.Seconds())
 			return nil
 		case <-ticker.C:
 			elapsed := time.Since(startTime).Seconds()
@@ -524,48 +563,6 @@ func runWaveGenerator() error {
 			bar := int(level * 40)
 			fmt.Printf("\r  Level: %5.1f%% [%s%s]", level*100,
 				strings.Repeat("#", bar), strings.Repeat(".", 40-bar))
-		}
-	}
-}
-
-func generateWaveTraces(ctx context.Context, tracer trace.Tracer, done <-chan struct{}) {
-	operations := []string{
-		"GET /api/users/{id}", "POST /api/orders", "GET /api/products",
-		"PUT /api/users/{id}", "GET /api/health", "POST /api/auth/login",
-	}
-
-	for {
-		select {
-		case <-done:
-			return
-		case <-ctx.Done():
-			return
-		default:
-			level := getWaveLevel()
-
-			// Rate: 5000ms at level=0 → 10ms at level=1 (exponential)
-			baseMs := 5000.0 * math.Pow(0.002, level)
-			delay := time.Duration(baseMs+rand.Float64()*baseMs) * time.Millisecond
-			time.Sleep(delay)
-
-			operation := operations[rand.Intn(len(operations))]
-			_, span := tracer.Start(ctx, operation)
-
-			spaceIdx := strings.Index(operation, " ")
-			span.SetAttributes(
-				attribute.String("http.method", operation[:spaceIdx]),
-				attribute.String("http.route", operation[spaceIdx+1:]),
-				attribute.String("user.id", fmt.Sprintf("user_%d", rand.Intn(1000))),
-			)
-
-			errorRate := 0.02 + level*0.48
-			if rand.Float64() < errorRate {
-				span.RecordError(fmt.Errorf("%s failed", operation))
-				span.SetStatus(codes.Error, "Request failed")
-			} else {
-				span.SetStatus(codes.Ok, "")
-			}
-			span.End()
 		}
 	}
 }
@@ -608,8 +605,8 @@ func generateWaveLogs(ctx context.Context, logger log.Logger, done <-chan struct
 	}
 }
 
-func getStatusCode(errorRate float64) int {
-	if rand.Float64() < errorRate {
+func getStatusCode(failed bool) int {
+	if failed {
 		codes := []int{400, 401, 403, 404, 500, 502, 503}
 		return codes[rand.Intn(len(codes))]
 	}

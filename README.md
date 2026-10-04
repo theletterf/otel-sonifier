@@ -56,18 +56,24 @@ The collector will start with:
 Generate telemetry at different activity levels:
 
 ```bash
-# Low activity (30s): 25 traces/sec, 10% constant metrics, 5% errors
+# Low (30s): 0.2 traces/sec, 10% constant metrics, 5% errors
 ./otelgen/otelgen low
 
-# Medium activity (60s): 67 traces/sec, 30% constant metrics, 15% errors
+# Medium (60s): 10 traces/sec, 30% constant metrics, 15% errors
 ./otelgen/otelgen medium
 
-# High activity (90s): 125 traces/sec, 60% constant metrics, 35% errors
+# High (90s): 100 traces/sec, 60% constant metrics, 35% errors
 ./otelgen/otelgen high
 
-# Stress testing (120s): 1000 traces/sec, 100% constant metrics, 50% errors
+# Stress (120s): 1000 traces/sec, 100% constant metrics, 50% errors
 ./otelgen/otelgen stress
+
+# Wave: load rises from 0% to 100% and back over two minutes, repeating
+# until Ctrl+C. Traces go from one every 5s to 1000/sec, errors from 2% to 50%.
+./otelgen/otelgen wave
 ```
+
+Press Ctrl+C to stop any mode early. otelgen prints how many traces it sent and the rate it achieved.
 
 ## Configuration
 
