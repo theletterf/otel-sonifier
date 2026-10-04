@@ -6,39 +6,19 @@ receivers:
       http:
         endpoint: 0.0.0.0:4318
 
-processors:
-
 exporters:
-  otlphttp:
-    endpoint: http://localhost:44444
-    encoding: json
-    compression: none
-    timeout: 100ms
-    sending_queue:
-      enabled: false
-    retry_on_failure:
-      enabled: false
-    tls:
-      insecure: true
-  debug:
-    verbosity: detailed
-
-extensions:
   sonifier:
-    endpoint: "localhost:44444"
+    # Web UI and WebSocket stream.
+    endpoint: localhost:44444
 
 service:
-  extensions: [sonifier]
   pipelines:
     traces:
       receivers: [otlp]
-      processors: []
-      exporters: [otlphttp, debug]
+      exporters: [sonifier]
     metrics:
       receivers: [otlp]
-      processors: []
-      exporters: [otlphttp, debug]
+      exporters: [sonifier]
     logs:
       receivers: [otlp]
-      processors: []
-      exporters: [otlphttp, debug]
+      exporters: [sonifier]

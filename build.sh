@@ -1,38 +1,21 @@
 #!/bin/bash
+# Builds the otelgen load generator and the collector with the Sonifier exporter.
 
 set -e
 
-# Set GOPATH if not set
-export GOPATH=${GOPATH:-$(go env GOPATH)}
-BUILDER_PATH="$GOPATH/bin/builder"
+BUILDER_VERSION=v0.162.0
+GOBIN=$(go env GOBIN)
+BUILDER="${GOBIN:-$(go env GOPATH)/bin}/builder"
 
-# Install builder if not already in the path
-if ! command -v builder &> /dev/null; then
-    if [ ! -f "$BUILDER_PATH" ]; then
-        echo "Builder not found, installing v0.131.0..."
-        go install go.opentelemetry.io/collector/cmd/builder@v0.131.0
-    fi
-else
-    BUILDER_PATH=$(command -v builder)
+if [ ! -x "$BUILDER" ] || ! "$BUILDER" version 2>/dev/null | grep -q "${BUILDER_VERSION#v}"; then
+    echo "Installing OpenTelemetry Collector Builder $BUILDER_VERSION..."
+    go install go.opentelemetry.io/collector/cmd/builder@$BUILDER_VERSION
 fi
 
-# Verify builder is available
-if [ ! -f "$BUILDER_PATH" ]; then
-    echo "Error: Builder installation failed or not found at $BUILDER_PATH"
-    exit 1
-fi
-
-# Build otelgen load generator
 echo "Building otelgen load generator..."
-cd otelgen
-go build -o otelgen
-cd ..
-echo "✅ otelgen built successfully"
+(cd otelgen && go build -o otelgen)
 
-# Build the collector
-echo "Building custom collector..."
-"$BUILDER_PATH" --config builder-config.yaml
+echo "Building collector..."
+"$BUILDER" --config=builder-config.yaml
 
-# Run the collector
-echo "Running custom collector..."
-./otelcol-sonifier/otelcol-sonifier --config collector-config.yaml
+echo "✅ Built ./otelcol-sonifier/otelcol-sonifier and ./otelgen/otelgen"
