@@ -17,6 +17,8 @@ OTel Sonifier embodies the principles of Calm Technology by making system health
 - **Audio feedback** is rain you can hear: drops as traces land, a hiss that grows with traffic, muffling when the system gets slow, and distant thunder during error storms. An optional AI-generated soundscape follows the mood.
 - **Services** each get their own band of the sky, and their own place in the stereo field, so you can tell where the weather is coming from.
 
+The goal is to create a monitoring experience that feels more like observing nature than managing infrastructure.
+
 ## How the weather is computed
 
 The exporter turns telemetry into weather on the collector, and sends the UI a small update five times a second. Open **Debug View** (http://localhost:44444/debug) to see the latest one.
@@ -41,9 +43,7 @@ Enable **Rain Sounds** for synthesized rain:
 - **The air** muffles everything as p95 latency rises above its baseline, so a slow system sounds like rain heard through a window.
 - **Thunder** rumbles in the distance, at most every 15 seconds, while errors are high.
 
-Enable **AI Soundscape** for generative music from [Lyria RealTime](https://ai.google.dev/gemini-api/docs/realtime-music-generation), which needs a Gemini API key. Your prompt sets the character of the music. As the mood worsens, a storm prompt is blended in with growing weight, and the music gets denser and darker. Updates are sent at most every two seconds.
-
-The goal is to create a monitoring experience that feels more like observing nature than managing infrastructure.
+Enable **AI Soundscape** for generative music from [Lyria RealTime](https://ai.google.dev/gemini-api/docs/realtime-music-generation), which needs a Gemini API key. Your prompt sets the character of the music. As the mood worsens, a storm prompt is blended in with growing weight, and the music gets denser and darker. Updates are sent at most every two seconds. The key is stored in your browser only.
 
 ## Quick start
 
@@ -73,10 +73,19 @@ Start the collector with the provided configuration:
 The collector will start with:
 
 - OTLP receivers on ports 4317 (gRPC) and 4318 (HTTP)
-- Sonifier web UI on http://localhost:44444
-- Real-time raindrop visualization of trace IDs
-- Audio feedback system with ground impact sounds
-- Smooth sky transitions as conditions change
+- The Sonifier web UI on http://localhost:44444
+
+Open the web UI, then generate some telemetry (see [Usage](#usage)). Browsers only play sound after you interact with the page, so tick **Rain Sounds** and, optionally, **AI Soundscape** in the top-left panel. The panel also shows the current mood and the request rate, error rate, and p95 latency. **Debug View** in the bottom-right corner shows the full weather update.
+
+### Use it with your own services
+
+Point any OpenTelemetry SDK or collector at the OTLP receivers, for example:
+
+```bash
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+```
+
+To add the sonifier to an existing collector instead, build your distribution with the exporter from `sonifierexporter/` (see `builder-config.yaml`) and add it to your pipelines, as shown in [Configuration](#configuration). Give the baseline a few minutes to learn what normal looks like before you judge the sky.
 
 ## Usage
 
@@ -92,15 +101,15 @@ Generate telemetry at different activity levels:
 # High (90s): 100 traces/sec, 60% constant metrics, 35% errors
 ./otelgen/otelgen high
 
-# Stress (120s): 1000 traces/sec, 100% constant metrics, 50% errors (capped per service)
+# Stress (120s): 1000 traces/sec, 100% constant metrics, ~43% errors
 ./otelgen/otelgen stress
 
 # Wave: load rises from 0% to 100% and back over two minutes, repeating
-# until Ctrl+C. Traces go from one every 5s to 1000/sec, errors from 2% to 50%.
+# until Ctrl+C. Traces go from one every 5s to 1000/sec, errors from 2% to ~43%.
 ./otelgen/otelgen wave
 ```
 
-Traces come from three simulated services: `frontend` (60% of requests), `checkout` (25%), and `payments` (15%), which fails three times as often as average. Press Ctrl+C to stop any mode early. otelgen prints how many traces it sent and the rate it achieved.
+Traces come from three simulated services: `frontend` (60% of requests), `checkout` (25%), and `payments` (15%). `payments` fails three times as often as the level's error rate, up to 100% of the time, so at the highest levels the overall error rate is a little below the nominal one. Press Ctrl+C to stop any mode early. otelgen prints how many traces it sent and the rate it achieved.
 
 ## Configuration
 
@@ -153,33 +162,23 @@ Build output (`otelcol-sonifier/` and `otelgen/otelgen`) is not checked in.
 
 ## Ideas for future development
 
-### How to represent cluster activity?
+### Sound
 
-The current system focuses on individual traces, but cluster-level monitoring could introduce:
+- **Loudness**: Lyria keeps its output level steady, so the soundscape gets darker but not louder in a storm. A gain stage driven by the mood would add that dimension.
+- **Quiet**: the exporter already scores traffic that drops far below baseline, but nothing renders it yet. It could thin the rain into fog or bring in a hollow wind.
+- **Harmony**: system health could steer chord progressions or shift musical modes, for example from major to minor as errors rise.
 
-- **Cloud formations**: Different cloud types representing cluster health states.
-- **Wind patterns**: Air currents showing inter-service communication flows.
-- **Seasonal changes**: Long-term trends manifesting as weather seasons.
-- **Geographic features**: Mountains and valleys representing resource utilization.
+### Weather model
 
-### Should logs be represented?
+- **Combining scores**: mood is the highest score, so one saturated signal (such as a 31% error rate) flattens everything above it. A weighted combination would keep more variation at the top.
+- **Logs**: log rates by severity are already in each update but don't affect the weather yet. Error logs could flash as lightning, and warnings could gather as clouds.
+- **Service dependencies**: parent and child spans across services could become wind between their lanes.
 
-Logs currently influence the overall atmosphere, but could be more directly visualized:
+### Scale
 
-- **Lightning strikes**: Error logs as brief, bright flashes across the sky.
-- **Thunder**: Warning logs as distant rumbles.
-- **Fog**: Info logs as atmospheric moisture that affects visibility.
-- **Storms**: Critical logs as weather fronts that change the entire environment.
-
-### Create generative ambience music in real time?
-
-The current audio system is minimal, but could evolve into:
-
-- **Weather-based soundscapes**: Rain intensity affecting background music tempo.
-- **Harmonic progression**: System health influencing chord structures.
-- **Instrument selection**: Different telemetry types choosing different instruments.
-- **Rhythmic patterns**: Trace frequency creating drum patterns.
-- **Mood modulation**: Error rates shifting musical modes from major to minor.
+- **Canvas rendering**: each raindrop is a set of DOM elements. Drawing on a canvas would allow denser rain and effects such as fog and lightning.
+- **Cluster activity**: cloud formations for cluster health, seasons for long-term trends, and terrain for resource utilization.
+- **A realistic demo**: run against the [OpenTelemetry Demo](https://opentelemetry.io/docs/demo/), whose feature flags inject real failure scenarios.
 
 ## License
 
