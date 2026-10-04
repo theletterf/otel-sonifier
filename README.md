@@ -14,7 +14,8 @@ OTel Sonifier embodies the principles of Calm Technology by making system health
 
 - **Rain patterns** represent requests: gentle drizzle for light traffic, intense downpour for heavy traffic. Rain drops are trace IDs, red when the request failed.
 - **Sky gradients** shift from deep blue (calm) through purple and red to the darkest storm as conditions get worse than what is normal for your system.
-- **Audio feedback** provides subtle raindrop sounds that sync with trace impacts, and an optional AI-generated soundscape that follows the mood.
+- **Audio feedback** is rain you can hear: drops as traces land, a hiss that grows with traffic, muffling when the system gets slow, and distant thunder during error storms. An optional AI-generated soundscape follows the mood.
+- **Services** each get their own band of the sky, and their own place in the stereo field, so you can tell where the weather is coming from.
 
 ## How the weather is computed
 
@@ -30,6 +31,17 @@ The exporter turns telemetry into weather on the collector, and sends the UI a s
   - *Quiet*: traffic far below baseline. Silence is worth noticing but is not a storm, so it does not affect the mood.
 - **Mood** is the highest of the scores, smoothed over a few seconds. It drives the sky and the soundscape.
 - **Drops** are a uniform sample of requests, at most 40 per update, so the share of red drops matches the error rate.
+
+## How it sounds
+
+Enable **Rain Sounds** for synthesized rain:
+
+- **Drops** tap as each raindrop lands, panned to its service's position. Failed requests land with a duller, lower tap.
+- **The rain bed** is a steady hiss whose loudness follows the request rate, from silent at 0 req/s to full at 1000 req/s.
+- **The air** muffles everything as p95 latency rises above its baseline, so a slow system sounds like rain heard through a window.
+- **Thunder** rumbles in the distance, at most every 15 seconds, while errors are high.
+
+Enable **AI Soundscape** for generative music from [Lyria RealTime](https://ai.google.dev/gemini-api/docs/realtime-music-generation), which needs a Gemini API key. Your prompt sets the character of the music. As the mood worsens, a storm prompt is blended in with growing weight, and the music gets denser and darker. Updates are sent at most every two seconds.
 
 The goal is to create a monitoring experience that feels more like observing nature than managing infrastructure.
 
@@ -80,7 +92,7 @@ Generate telemetry at different activity levels:
 # High (90s): 100 traces/sec, 60% constant metrics, 35% errors
 ./otelgen/otelgen high
 
-# Stress (120s): 1000 traces/sec, 100% constant metrics, 50% errors
+# Stress (120s): 1000 traces/sec, 100% constant metrics, 50% errors (capped per service)
 ./otelgen/otelgen stress
 
 # Wave: load rises from 0% to 100% and back over two minutes, repeating
@@ -88,7 +100,7 @@ Generate telemetry at different activity levels:
 ./otelgen/otelgen wave
 ```
 
-Press Ctrl+C to stop any mode early. otelgen prints how many traces it sent and the rate it achieved.
+Traces come from three simulated services: `frontend` (60% of requests), `checkout` (25%), and `payments` (15%), which fails three times as often as average. Press Ctrl+C to stop any mode early. otelgen prints how many traces it sent and the rate it achieved.
 
 ## Configuration
 

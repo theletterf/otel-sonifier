@@ -195,13 +195,11 @@ func runGenerator(config Config) error {
 		return fmt.Errorf("failed to create log exporter: %w", err)
 	}
 
-	tp, mp, lp := newProviders(res, traceExporter, metricExporter, logExporter, 2*time.Second)
-	defer shutdownProviders(tp, mp, lp)
-	otel.SetTracerProvider(tp)
+	fleet, mp, lp := newProviders(res, traceExporter, metricExporter, logExporter, 2*time.Second)
+	defer shutdownProviders(fleet, mp, lp)
 	otel.SetMeterProvider(mp)
 
 	// Create telemetry instruments
-	tracer := otel.Tracer("otelgen")
 	meter := otel.Meter("otelgen")
 	logger := lp.Logger("otelgen")
 
@@ -216,7 +214,7 @@ func runGenerator(config Config) error {
 	start := time.Now()
 
 	// Trace generator
-	traces := generateTraces(ctx, tracer,
+	traces := generateTraces(ctx, fleet,
 		func() time.Duration { return config.TraceRate },
 		func() float64 { return config.ErrorRate })
 
@@ -236,17 +234,72 @@ func runGenerator(config Config) error {
 	return nil
 }
 
-// newProviders sets up the SDK providers. Spans are exported in batches every
-// 100ms: one RPC per span cannot keep up with the higher load levels.
+// simService is one of the simulated services traces come from.
+type simService struct {
+	name string
+	// share is the fraction of requests this service handles.
+	share float64
+	// errorFactor scales the error rate for this service. Shares times
+	// factors sum to 1, so the overall error rate matches the level.
+	errorFactor float64
+
+	tp     *sdktrace.TracerProvider
+	tracer trace.Tracer
+}
+
+// The simulated system: most traffic hits the frontend, and most errors come
+// from payments, as in a typical incident.
+var serviceMix = []simService{
+	{name: "frontend", share: 0.60, errorFactor: 0.5},
+	{name: "checkout", share: 0.25, errorFactor: 1.0},
+	{name: "payments", share: 0.15, errorFactor: 3.0},
+}
+
+type fleet struct {
+	services []*simService
+	exporter sdktrace.SpanExporter
+}
+
+func (f *fleet) pick() *simService {
+	r := rand.Float64()
+	for _, s := range f.services {
+		if r < s.share {
+			return s
+		}
+		r -= s.share
+	}
+	return f.services[len(f.services)-1]
+}
+
+// sharedExporter lets several tracer providers use one exporter. Each
+// provider shuts down its exporter; the real exporter is shut down once,
+// after all providers have flushed.
+type sharedExporter struct{ sdktrace.SpanExporter }
+
+func (sharedExporter) Shutdown(context.Context) error { return nil }
+
+// newProviders sets up the SDK providers, with one tracer provider per
+// simulated service. Spans are exported in batches every 100ms: one RPC per
+// span cannot keep up with the higher load levels.
 func newProviders(res *resource.Resource, te sdktrace.SpanExporter, me sdkmetric.Exporter,
-	le sdklog.Exporter, metricInterval time.Duration) (*sdktrace.TracerProvider, *sdkmetric.MeterProvider, *sdklog.LoggerProvider) {
-	tp := sdktrace.NewTracerProvider(
-		sdktrace.WithBatcher(te,
-			sdktrace.WithBatchTimeout(100*time.Millisecond),
-			sdktrace.WithMaxQueueSize(20000),
-		),
-		sdktrace.WithResource(res),
-	)
+	le sdklog.Exporter, metricInterval time.Duration) (*fleet, *sdkmetric.MeterProvider, *sdklog.LoggerProvider) {
+	f := &fleet{exporter: te}
+	for _, mix := range serviceMix {
+		svc := mix
+		svcRes, err := resource.Merge(res, resource.NewSchemaless(semconv.ServiceName(svc.name)))
+		if err != nil {
+			svcRes = res
+		}
+		svc.tp = sdktrace.NewTracerProvider(
+			sdktrace.WithBatcher(sharedExporter{te},
+				sdktrace.WithBatchTimeout(100*time.Millisecond),
+				sdktrace.WithMaxQueueSize(20000),
+			),
+			sdktrace.WithResource(svcRes),
+		)
+		svc.tracer = svc.tp.Tracer("otelgen")
+		f.services = append(f.services, &svc)
+	}
 	mp := sdkmetric.NewMeterProvider(
 		sdkmetric.WithReader(sdkmetric.NewPeriodicReader(me, sdkmetric.WithInterval(metricInterval))),
 		sdkmetric.WithResource(res),
@@ -255,15 +308,18 @@ func newProviders(res *resource.Resource, te sdktrace.SpanExporter, me sdkmetric
 		sdklog.WithProcessor(sdklog.NewBatchProcessor(le)),
 		sdklog.WithResource(res),
 	)
-	return tp, mp, lp
+	return f, mp, lp
 }
 
 // shutdownProviders flushes and stops the providers (and their exporters).
 // It uses a fresh context because the run's context is already done by now.
-func shutdownProviders(tp *sdktrace.TracerProvider, mp *sdkmetric.MeterProvider, lp *sdklog.LoggerProvider) {
+func shutdownProviders(f *fleet, mp *sdkmetric.MeterProvider, lp *sdklog.LoggerProvider) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_ = tp.Shutdown(ctx)
+	for _, s := range f.services {
+		_ = s.tp.Shutdown(ctx)
+	}
+	_ = f.exporter.Shutdown(ctx)
 	_ = mp.Shutdown(ctx)
 	_ = lp.Shutdown(ctx)
 }
@@ -297,7 +353,7 @@ func (r *traceRun) wait() int64 {
 // generateTraces starts simulated requests at an average rate of one per
 // interval() until ctx is done. Each request runs in its own goroutine, so
 // simulated processing time does not limit the rate.
-func generateTraces(ctx context.Context, tracer trace.Tracer, interval func() time.Duration, errorRate func() float64) *traceRun {
+func generateTraces(ctx context.Context, f *fleet, interval func() time.Duration, errorRate func() float64) *traceRun {
 	run := &traceRun{done: make(chan struct{})}
 	go func() {
 		defer close(run.done)
@@ -306,22 +362,22 @@ func generateTraces(ctx context.Context, tracer trace.Tracer, interval func() ti
 			run.sent.Add(1)
 			go func() {
 				defer run.wg.Done()
-				simulateRequest(tracer, errorRate())
+				simulateRequest(f.pick(), errorRate())
 			}()
 		})
 	}()
 	return run
 }
 
-func simulateRequest(tracer trace.Tracer, errorRate float64) {
+func simulateRequest(svc *simService, errorRate float64) {
 	operation := operations[rand.Intn(len(operations))]
 
 	// Not derived from the run's context, so requests in flight at the end
 	// still finish and get exported.
-	_, span := tracer.Start(context.Background(), operation)
+	_, span := svc.tracer.Start(context.Background(), operation)
 
 	spaceIdx := strings.Index(operation, " ")
-	failed := rand.Float64() < errorRate
+	failed := rand.Float64() < min(1, errorRate*svc.errorFactor)
 	span.SetAttributes(
 		attribute.String("http.method", operation[:spaceIdx]),
 		attribute.String("http.route", operation[spaceIdx+1:]),
@@ -503,12 +559,10 @@ func runWaveGenerator() error {
 		return fmt.Errorf("failed to create log exporter: %w", err)
 	}
 
-	tp, mp, lp := newProviders(res, traceExporter, metricExporter, logExporter, 1*time.Second)
-	defer shutdownProviders(tp, mp, lp)
-	otel.SetTracerProvider(tp)
+	fleet, mp, lp := newProviders(res, traceExporter, metricExporter, logExporter, 1*time.Second)
+	defer shutdownProviders(fleet, mp, lp)
 	otel.SetMeterProvider(mp)
 
-	tracer := otel.Tracer("otelgen")
 	meter := otel.Meter("otelgen")
 	logger := lp.Logger("otelgen")
 
@@ -523,7 +577,7 @@ func runWaveGenerator() error {
 
 	// Wave-aware trace generator: rate follows the level, from one trace
 	// every 5s at 0% to 1000 traces/sec at 100% (exponential)
-	traces := generateTraces(ctx, tracer,
+	traces := generateTraces(ctx, fleet,
 		func() time.Duration {
 			return time.Duration(5000 * math.Pow(0.0002, getWaveLevel()) * float64(time.Millisecond))
 		},

@@ -2,16 +2,26 @@ const WS_URL = 'wss://generativelanguage.googleapis.com/ws/google.ai.generativel
 const MODEL = 'models/lyria-realtime-exp';
 const SAMPLE_RATE = 48000;
 
-// Fixed structural params — no RESET_CONTEXT ever
+// Fixed structural params — no RESET_CONTEXT ever. Lyria replaces the whole
+// config on every update, so these are sent each time to keep them set.
 const FIXED_BPM = 88;
 const FIXED_SCALE = "C_MAJOR_A_MINOR";
 
-// Single prompt — the soundscape identity never changes.
-// Density and brightness do all the expressive work.
-const SOUNDSCAPE_PROMPT = "Ambient electronic soundscape, soft synth pads, atmospheric textures, gentle evolving tones";
+// Moderate, fixed guidance: higher guidance makes transitions more abrupt.
+const GUIDANCE = 3.0;
 
-// Min change in metricLevel to trigger an update
-const UPDATE_THRESHOLD = 0.01;
+// The base prompt (default or the user's) is the soundscape's identity. As the
+// mood worsens, a storm prompt is blended in with growing weight, which is how
+// Lyria morphs music smoothly.
+const SOUNDSCAPE_PROMPT = "Ambient electronic soundscape, soft synth pads, atmospheric textures, gentle evolving tones";
+const STORM_PROMPT = "Tense and turbulent, dark rumbling drones, driving percussion, dissonant swells";
+const STORM_MIN_LEVEL = 0.05;
+const STORM_MAX_WEIGHT = 1.5;
+
+// Mood arrives several times a second; Lyria gets at most one update per
+// interval, and only for a noticeable change.
+const UPDATE_INTERVAL_MS = 2000;
+const UPDATE_THRESHOLD = 0.03;
 
 export class SoundscapeEngine {
     constructor() {
@@ -22,6 +32,8 @@ export class SoundscapeEngine {
         this.isPlaying = false;
         this.nextPlayTime = 0;
         this.lastMetricLevel = -1;
+        this.pendingLevel = 0;
+        this.updateTimer = null;
         this.currentPrompt = SOUNDSCAPE_PROMPT;
         this.onStatusChange = null;
     }
@@ -120,11 +132,12 @@ export class SoundscapeEngine {
     }
 
     async _reconnect() {
-        const savedLevel = this.lastMetricLevel;
+        // Resume at the latest mood, not the last one sent before the drop.
+        const savedLevel = this.pendingLevel;
         const savedPrompt = this.currentPrompt;
         try {
             await this.connect(this.apiKey);
-            await this.start(savedLevel >= 0 ? savedLevel : 0, savedPrompt);
+            await this.start(savedLevel, savedPrompt);
         } catch (e) {
             console.error('Lyria reconnect failed:', e);
             this._setStatus('error');
@@ -135,51 +148,66 @@ export class SoundscapeEngine {
         if (!this.isConnected) return;
 
         this.nextPlayTime = this.audioContext.currentTime;
-        this.lastMetricLevel = metricLevel;
 
         // Use custom prompt if provided, otherwise default
         this.currentPrompt = customPrompt || SOUNDSCAPE_PROMPT;
-        this._sendPrompts([{ text: this.currentPrompt, weight: 1.0 }]);
-
-        // Send initial config with fixed structure
-        this._sendConfig({
-            bpm: FIXED_BPM,
-            scale: FIXED_SCALE,
-            ...this._levelToConfig(metricLevel),
-        });
+        this.pendingLevel = metricLevel;
+        this._applyLevel(metricLevel);
 
         this._sendPlayback('PLAY');
         this.isPlaying = true;
         this._setStatus('playing');
+
+        clearInterval(this.updateTimer);
+        this.updateTimer = setInterval(() => this._flushLevel(), UPDATE_INTERVAL_MS);
     }
 
     updateFromTelemetry(metricLevel) {
+        this.pendingLevel = metricLevel;
+    }
+
+    _flushLevel() {
         if (!this.isPlaying) return;
-        if (Math.abs(metricLevel - this.lastMetricLevel) < UPDATE_THRESHOLD) return;
+        if (Math.abs(this.pendingLevel - this.lastMetricLevel) < UPDATE_THRESHOLD) return;
+        this._applyLevel(this.pendingLevel);
+    }
 
-        this.lastMetricLevel = metricLevel;
-
-        const config = this._levelToConfig(metricLevel);
+    // Sends the prompts and the full config for a level.
+    _applyLevel(level) {
+        this.lastMetricLevel = level;
+        this._sendPrompts(this._levelToPrompts(level));
+        const config = this._levelToConfig(level);
         this._sendConfig(config);
-
-        console.log(`Lyria: level=${metricLevel.toFixed(2)} density=${config.density.toFixed(2)} brightness=${config.brightness.toFixed(2)} guidance=${config.guidance.toFixed(1)} temp=${config.temperature.toFixed(1)}`);
+        console.log(`Lyria: level=${level.toFixed(2)} storm=${(this._stormWeight(level)).toFixed(2)} density=${config.density.toFixed(2)} brightness=${config.brightness.toFixed(2)} temp=${config.temperature.toFixed(2)}`);
     }
 
     setPrompt(prompt) {
         this.currentPrompt = prompt || SOUNDSCAPE_PROMPT;
         if (this.isPlaying) {
-            this._sendPrompts([{ text: this.currentPrompt, weight: 1.0 }]);
+            this._sendPrompts(this._levelToPrompts(this.lastMetricLevel));
             console.log('Lyria: prompt updated');
         }
     }
 
+    _stormWeight(level) {
+        return level < STORM_MIN_LEVEL ? 0 : level * STORM_MAX_WEIGHT;
+    }
+
+    _levelToPrompts(level) {
+        const prompts = [{ text: this.currentPrompt, weight: 1.0 }];
+        const storm = this._stormWeight(level);
+        if (storm > 0) prompts.push({ text: STORM_PROMPT, weight: storm });
+        return prompts;
+    }
+
     _levelToConfig(level) {
         return {
-            density: 0.05 + level * 0.95,      // 0.05 → 1.0  (near-silent to packed)
-            brightness: 0.85 - level * 0.75,    // 0.85 → 0.10 (bright/airy to dark/heavy)
-            guidance: 1.0 + level * 5.0,        // 1.0  → 6.0  (loose to intense)
-            temperature: 0.7 + level * 1.3,     // 0.7  → 2.0  (steady to chaotic)
-            topK: Math.round(250 - level * 200), // 250  → 50   (diverse to focused)
+            bpm: FIXED_BPM,
+            scale: FIXED_SCALE,
+            guidance: GUIDANCE,
+            density: 0.1 + level * 0.85,        // 0.1 → 0.95 (sparse to busy)
+            brightness: 0.7 - level * 0.5,      // 0.7 → 0.2  (airy to dark)
+            temperature: 1.0 + level * 0.4,     // 1.0 → 1.4  (steady to restless)
         };
     }
 
@@ -247,6 +275,8 @@ export class SoundscapeEngine {
 
     async stop() {
         this.isPlaying = false;
+        clearInterval(this.updateTimer);
+        this.updateTimer = null;
         if (this.ws && this.ws.readyState === WebSocket.OPEN) {
             this._sendPlayback('STOP');
             this.ws.close();

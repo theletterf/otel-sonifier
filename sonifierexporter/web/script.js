@@ -10,6 +10,9 @@ class TelemetryVisualizer {
         this.raindrops = [];
         this.errorBlooms = [];
 
+        // Each service gets a lane: a band of the screen and a stereo position
+        this.lanes = new Map();
+
         // Sky layers, from calm to stormy, crossfaded by mood
         this.skyLayers = ['sky-low', 'sky-medium', 'sky-high', 'sky-stress']
             .map(id => document.getElementById(id));
@@ -164,6 +167,10 @@ class TelemetryVisualizer {
         this.soundscapeEngine.updateFromTelemetry(weather.mood);
 
         this.setSky(weather.mood);
+        this.updateLanes(weather.services);
+        if (this.isAudioEnabled) {
+            this.rainEngine.update(weather);
+        }
 
         document.getElementById('activity-value').textContent =
             `${Math.round(weather.mood * 100)}%`;
@@ -186,6 +193,24 @@ class TelemetryVisualizer {
         const errors = `${Math.round(weather.errorRate * 100)}% errors`;
         const p95 = weather.p95 > 0 ? ` · p95 ${Math.round(weather.p95)}ms` : '';
         return `${rate} req/s · ${errors}${p95}`;
+    }
+
+    // Spread the busiest services evenly across the screen, in name order so
+    // lanes stay put while rates change. With one service, rain uses the
+    // whole width.
+    updateLanes(services) {
+        const names = services.map(s => s.name).sort();
+        this.lanes.clear();
+        names.forEach((name, i) => {
+            const width = 1 / names.length;
+            this.lanes.set(name, { start: i * width, width });
+        });
+    }
+
+    // Returns where a drop falls (0..1 across the screen) for its service.
+    dropPosition(service) {
+        const lane = this.lanes.get(service) || { start: 0, width: 1 };
+        return lane.start + Math.random() * lane.width;
     }
 
     // Crossfade the sky layers: each layer is fully visible at its own point
@@ -217,8 +242,9 @@ class TelemetryVisualizer {
             raindrop.appendChild(charElement);
         }
         
-        // Random horizontal position, start from top
-        const leftPercent = Math.random() * 95; // Leave some margin
+        // Horizontal position within the service's lane, start from top
+        const position = this.dropPosition(drop.service);
+        const leftPercent = position * 95; // Leave some margin
         const startY = -50 - Math.random() * 100; // Start above viewport
         
         // Position raindrop
@@ -237,7 +263,8 @@ class TelemetryVisualizer {
             if (raindrop.parentNode) {
                 // Play raindrop sound when hitting ground
                 if (this.isAudioEnabled) {
-                    this.rainEngine.playRaindropSound();
+                    // Sound comes from where the drop lands
+                    this.rainEngine.playRaindropSound(position * 2 - 1, drop.error);
                 }
                 
                 // Create ground splash effect
