@@ -1,29 +1,36 @@
 import { RainEngine } from './rain-engine.js';
 import { TelemetryAnalyzer } from './telemetry-analyzer.js';
+import { SoundscapeEngine } from './soundscape-engine.js';
 
 class TelemetryVisualizer {
     constructor() {
         this.rainEngine = new RainEngine();
+        this.soundscapeEngine = new SoundscapeEngine();
         this.telemetryAnalyzer = new TelemetryAnalyzer();
         this.isAudioEnabled = false;
         this.currentActivity = 0;
         this.raindrops = [];
         this.errorBlooms = [];
-        
+
         // Constant rain system
         this.traceQueue = [];
         this.basePlaybackRate = 20; // Base: 20ms between drops (50/sec)
         this.currentPlaybackRate = this.basePlaybackRate;
         this.lastTraceCount = 0;
-        
+
         // Target metric level tracking
         this.targetMetricLevel = 0;
         this.currentSkyId = 'sky-low';
-        
+
+        // Combined activity level for soundscape (decays toward 0 when no data)
+        this.rawActivityLevel = 0;
+        this.lastActivityTime = 0;
+
         this.initializeUI();
         this.startDataFetching();
         this.setupAnimationLoop();
         this.startConstantRain();
+        this.startSoundscapeDecay();
     }
 
     initializeUI() {
@@ -36,6 +43,85 @@ class TelemetryVisualizer {
                 this.rainEngine.stop();
             }
         });
+
+        // Soundscape controls
+        const soundscapeToggle = document.getElementById('soundscape-enabled');
+        const soundscapeConfig = document.getElementById('soundscape-config');
+        const apiKeyInput = document.getElementById('api-key');
+        const promptInput = document.getElementById('soundscape-prompt');
+        const setButton = document.getElementById('soundscape-set');
+        const statusEl = document.getElementById('soundscape-status');
+
+        // Restore saved values
+        const savedKey = localStorage.getItem('gemini-api-key');
+        if (savedKey) apiKeyInput.value = savedKey;
+        const savedPrompt = localStorage.getItem('soundscape-prompt');
+        if (savedPrompt) promptInput.value = savedPrompt;
+
+        this.soundscapeEngine.onStatusChange = (status) => {
+            statusEl.className = status;
+            const labels = {
+                connected: 'Ready',
+                playing: 'Playing',
+                reconnecting: 'Reconnecting...',
+                error: 'Error',
+                stopped: '',
+                disconnected: '',
+            };
+            statusEl.textContent = labels[status] || status;
+        };
+
+        soundscapeToggle.addEventListener('change', async (e) => {
+            if (e.target.checked) {
+                soundscapeConfig.style.display = 'block';
+                const key = apiKeyInput.value.trim();
+                if (key) {
+                    localStorage.setItem('gemini-api-key', key);
+                    await this._startSoundscape(key, promptInput.value.trim());
+                }
+            } else {
+                soundscapeConfig.style.display = 'none';
+                this.soundscapeEngine.stop();
+            }
+        });
+
+        apiKeyInput.addEventListener('keydown', async (e) => {
+            if (e.key === 'Enter') {
+                const key = apiKeyInput.value.trim();
+                if (key && soundscapeToggle.checked) {
+                    localStorage.setItem('gemini-api-key', key);
+                    await this._startSoundscape(key, promptInput.value.trim());
+                }
+            }
+        });
+
+        setButton.addEventListener('click', async () => {
+            const prompt = promptInput.value.trim();
+            localStorage.setItem('soundscape-prompt', prompt);
+            if (this.soundscapeEngine.isPlaying) {
+                this.soundscapeEngine.setPrompt(prompt);
+            } else {
+                const key = apiKeyInput.value.trim();
+                if (key && soundscapeToggle.checked) {
+                    localStorage.setItem('gemini-api-key', key);
+                    await this._startSoundscape(key, prompt);
+                }
+            }
+        });
+    }
+
+    async _startSoundscape(apiKey, customPrompt) {
+        const statusEl = document.getElementById('soundscape-status');
+        try {
+            statusEl.textContent = 'Connecting...';
+            statusEl.className = '';
+            await this.soundscapeEngine.connect(apiKey);
+            await this.soundscapeEngine.start(this.rawActivityLevel, customPrompt);
+        } catch (err) {
+            console.error('Soundscape failed to start:', err);
+            statusEl.textContent = 'Failed';
+            statusEl.className = 'error';
+        }
     }
 
     startDataFetching() {
@@ -86,25 +172,33 @@ class TelemetryVisualizer {
         );
         const logActivity = Math.min(telemetry.logs.totalCount / 10, 1); // Count total logs, not just errors
         
-        // Update current activity but don't let it drop to zero instantly
-        const newActivity = Math.max(traceActivity, metricActivity, logActivity); // Take max, not average
-        this.currentActivity = Math.max(this.currentActivity * 0.95, newActivity, 0.1); // Smooth decay with floor
-        
-        // Detect and lock onto the target metric level from otelgen constant values
+        // Update current activity — tracks new data quickly, decays when idle
+        const newActivity = Math.max(traceActivity, metricActivity, logActivity);
+        if (newActivity >= this.currentActivity) {
+            // Jump up immediately to new highs
+            this.currentActivity = newActivity;
+        } else {
+            // Gentle decay when activity drops (0.9 per update instead of 0.95)
+            this.currentActivity = Math.max(this.currentActivity * 0.9, newActivity);
+        }
+
+        // Feed combined activity to soundscape (all signals)
+        this.rawActivityLevel = this.currentActivity;
+        this.lastActivityTime = Date.now();
+        this.soundscapeEngine.updateFromTelemetry(this.currentActivity);
+
+        // Sky gradient driven by metrics (discrete levels)
         if (dataType === 'metrics' && metricActivity > 0) {
-            // Round to nearest otelgen level: 0.1, 0.3, 0.6, 1.0
             let detectedLevel;
             if (metricActivity < 0.2) {
-                detectedLevel = 0.1; // Low level
+                detectedLevel = 0.1;
             } else if (metricActivity < 0.45) {
-                detectedLevel = 0.3; // Medium level
+                detectedLevel = 0.3;
             } else if (metricActivity < 0.8) {
-                detectedLevel = 0.6; // High level  
+                detectedLevel = 0.6;
             } else {
-                detectedLevel = 1.0; // Stress level
+                detectedLevel = 1.0;
             }
-            
-            // Only update if we detected a new level
             if (detectedLevel !== this.targetMetricLevel) {
                 this.targetMetricLevel = detectedLevel;
                 this.updateSkyGradient(this.targetMetricLevel);
@@ -313,6 +407,17 @@ class TelemetryVisualizer {
         
         // Start the constant rain
         playNextTrace();
+    }
+
+    startSoundscapeDecay() {
+        // When no telemetry arrives for 3s, decay toward 0
+        setInterval(() => {
+            if (Date.now() - this.lastActivityTime > 3000 && this.rawActivityLevel > 0.01) {
+                this.rawActivityLevel *= 0.85;
+                if (this.rawActivityLevel < 0.01) this.rawActivityLevel = 0;
+                this.soundscapeEngine.updateFromTelemetry(this.rawActivityLevel);
+            }
+        }, 1000);
     }
 
     setupAnimationLoop() {

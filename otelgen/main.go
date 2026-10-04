@@ -3,9 +3,12 @@ package main
 import (
 	"context"
 	"fmt"
+	"math"
 	"math/rand"
 	"os"
+	"os/signal"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -124,11 +127,17 @@ func main() {
 
 	stressCmd := &cobra.Command{
 		Use:   "stress",
-		Short: "Generate stress-level telemetry data with 10x more traces", 
+		Short: "Generate stress-level telemetry data with 10x more traces",
 		RunE:  func(cmd *cobra.Command, args []string) error { return runGenerator(stressConfig) },
 	}
 
-	rootCmd.AddCommand(lowCmd, mediumCmd, highCmd, stressCmd)
+	waveCmd := &cobra.Command{
+		Use:   "wave",
+		Short: "Smooth sine wave from 0% to 100% over 2min, repeating until Ctrl+C",
+		RunE:  func(cmd *cobra.Command, args []string) error { return runWaveGenerator() },
+	}
+
+	rootCmd.AddCommand(lowCmd, mediumCmd, highCmd, stressCmd, waveCmd)
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -384,6 +393,216 @@ func generateLogs(ctx context.Context, logger log.Logger, config Config, done <-
 				log.Int64("request.id", int64(rand.Intn(100000))),
 			)
 			
+			logger.Emit(ctx, record)
+		}
+	}
+}
+
+// waveLevel stores the current wave level (0-1000 representing 0.0-1.0)
+// shared between the wave ticker and trace/log generators
+var waveLevel atomic.Int64
+
+func getWaveLevel() float64 {
+	return float64(waveLevel.Load()) / 1000.0
+}
+
+func runWaveGenerator() error {
+	fmt.Println("Starting wave mode: smooth 0%->100%->0% over 2min, repeating until Ctrl+C")
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+
+	res, err := resource.New(ctx,
+		resource.WithAttributes(
+			semconv.ServiceName("otelgen"),
+			semconv.ServiceVersion("1.0.0"),
+			attribute.String("load.level", "Wave"),
+		),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create resource: %w", err)
+	}
+
+	traceExporter, err := otlptracegrpc.New(ctx,
+		otlptracegrpc.WithEndpoint("localhost:4317"),
+		otlptracegrpc.WithInsecure(),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create trace exporter: %w", err)
+	}
+	defer traceExporter.Shutdown(ctx)
+
+	metricExporter, err := otlpmetricgrpc.New(ctx,
+		otlpmetricgrpc.WithEndpoint("localhost:4317"),
+		otlpmetricgrpc.WithInsecure(),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create metric exporter: %w", err)
+	}
+	defer metricExporter.Shutdown(ctx)
+
+	logExporter, err := otlploggrpc.New(ctx,
+		otlploggrpc.WithEndpoint("localhost:4317"),
+		otlploggrpc.WithInsecure(),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create log exporter: %w", err)
+	}
+	defer logExporter.Shutdown(ctx)
+
+	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(traceExporter,
+			sdktrace.WithBatchTimeout(1*time.Millisecond),
+			sdktrace.WithMaxExportBatchSize(1),
+			sdktrace.WithExportTimeout(100*time.Millisecond),
+		),
+		sdktrace.WithResource(res),
+	)
+	defer tp.Shutdown(ctx)
+	otel.SetTracerProvider(tp)
+
+	mp := sdkmetric.NewMeterProvider(
+		sdkmetric.WithReader(sdkmetric.NewPeriodicReader(
+			metricExporter,
+			sdkmetric.WithInterval(1*time.Second),
+		)),
+		sdkmetric.WithResource(res),
+	)
+	defer mp.Shutdown(ctx)
+	otel.SetMeterProvider(mp)
+
+	lp := sdklog.NewLoggerProvider(
+		sdklog.WithProcessor(sdklog.NewBatchProcessor(logExporter)),
+		sdklog.WithResource(res),
+	)
+	defer lp.Shutdown(ctx)
+
+	tracer := otel.Tracer("otelgen")
+	meter := otel.Meter("otelgen")
+	logger := lp.Logger("otelgen")
+
+	cpuGauge, _ := meter.Float64Gauge("system.cpu.utilization")
+	memoryGauge, _ := meter.Float64Gauge("system.memory.utilization")
+	diskCounter, _ := meter.Int64Counter("system.disk.io")
+
+	startTime := time.Now()
+	cycleDuration := 120.0 // 2 minutes
+
+	done := make(chan struct{})
+
+	// Wave-aware trace generator: rate follows the level
+	go generateWaveTraces(ctx, tracer, done)
+
+	// Wave-aware log generator: rate and severity follow the level
+	go generateWaveLogs(ctx, logger, done)
+
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			close(done)
+			fmt.Println("\nWave stopped")
+			return nil
+		case <-ticker.C:
+			elapsed := time.Since(startTime).Seconds()
+			progress := math.Mod(elapsed, cycleDuration) / cycleDuration
+			level := (math.Sin(2*math.Pi*progress-math.Pi/2) + 1) / 2
+
+			// Publish level for trace/log generators
+			waveLevel.Store(int64(level * 1000))
+
+			// Record metrics at current level
+			cpuGauge.Record(ctx, level,
+				metric.WithAttributes(attribute.String("host", "app-server-01")))
+			memoryGauge.Record(ctx, level,
+				metric.WithAttributes(attribute.String("host", "app-server-01")))
+			diskCounter.Add(ctx, int64(level*1024),
+				metric.WithAttributes(attribute.String("device", "/dev/sda1")))
+
+			bar := int(level * 40)
+			fmt.Printf("\r  Level: %5.1f%% [%s%s]", level*100,
+				strings.Repeat("#", bar), strings.Repeat(".", 40-bar))
+		}
+	}
+}
+
+func generateWaveTraces(ctx context.Context, tracer trace.Tracer, done <-chan struct{}) {
+	operations := []string{
+		"GET /api/users/{id}", "POST /api/orders", "GET /api/products",
+		"PUT /api/users/{id}", "GET /api/health", "POST /api/auth/login",
+	}
+
+	for {
+		select {
+		case <-done:
+			return
+		case <-ctx.Done():
+			return
+		default:
+			level := getWaveLevel()
+
+			// Rate: 5000ms at level=0 → 10ms at level=1 (exponential)
+			baseMs := 5000.0 * math.Pow(0.002, level)
+			delay := time.Duration(baseMs+rand.Float64()*baseMs) * time.Millisecond
+			time.Sleep(delay)
+
+			operation := operations[rand.Intn(len(operations))]
+			_, span := tracer.Start(ctx, operation)
+
+			spaceIdx := strings.Index(operation, " ")
+			span.SetAttributes(
+				attribute.String("http.method", operation[:spaceIdx]),
+				attribute.String("http.route", operation[spaceIdx+1:]),
+				attribute.String("user.id", fmt.Sprintf("user_%d", rand.Intn(1000))),
+			)
+
+			errorRate := 0.02 + level*0.48
+			if rand.Float64() < errorRate {
+				span.RecordError(fmt.Errorf("%s failed", operation))
+				span.SetStatus(codes.Error, "Request failed")
+			} else {
+				span.SetStatus(codes.Ok, "")
+			}
+			span.End()
+		}
+	}
+}
+
+func generateWaveLogs(ctx context.Context, logger log.Logger, done <-chan struct{}) {
+	messages := map[log.Severity][]string{
+		log.SeverityInfo:  {"Health check passed", "Cache hit", "Request completed", "Connection established"},
+		log.SeverityWarn:  {"Rate limit approaching", "Slow query detected", "Memory usage high"},
+		log.SeverityError: {"Connection failed", "Timeout occurred", "Disk space low"},
+		log.SeverityFatal: {"Critical failure", "Out of memory"},
+	}
+
+	for {
+		select {
+		case <-done:
+			return
+		case <-ctx.Done():
+			return
+		default:
+			level := getWaveLevel()
+
+			// Rate: 5s at level=0 → 100ms at level=1
+			baseMs := 5000.0 * math.Pow(0.02, level)
+			time.Sleep(time.Duration(baseMs) * time.Millisecond)
+
+			severity := getSeverity(level * 0.8)
+			severityMessages := messages[severity]
+			message := severityMessages[rand.Intn(len(severityMessages))]
+
+			record := log.Record{}
+			record.SetTimestamp(time.Now())
+			record.SetBody(log.StringValue(message))
+			record.SetSeverity(severity)
+			record.AddAttributes(
+				log.String("component", "api-server"),
+				log.String("user.id", fmt.Sprintf("user_%d", rand.Intn(1000))),
+			)
 			logger.Emit(ctx, record)
 		}
 	}

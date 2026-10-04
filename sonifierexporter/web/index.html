@@ -177,6 +177,75 @@
                 transform: scale(1.5) translateY(-20px);
             }
         }
+
+        .control-divider {
+            border-top: 1px solid rgba(255,255,255,0.15);
+            margin: 10px 0;
+        }
+
+        #api-key-group {
+            margin-top: 6px;
+        }
+
+        #api-key {
+            width: 170px;
+            padding: 4px 8px;
+            border: 1px solid rgba(255,255,255,0.2);
+            border-radius: 4px;
+            background: rgba(255,255,255,0.1);
+            color: #fff;
+            font-size: 12px;
+            outline: none;
+        }
+
+        #api-key::placeholder {
+            color: rgba(255,255,255,0.4);
+        }
+
+        #soundscape-status {
+            display: inline-block;
+            margin-left: 6px;
+            font-size: 11px;
+            color: rgba(255,255,255,0.5);
+        }
+
+        #soundscape-status.playing { color: #7be87b; }
+        #soundscape-status.error { color: #ff8888; }
+        #soundscape-status.reconnecting { color: #ffd966; }
+
+        #soundscape-prompt {
+            display: block;
+            width: 100%;
+            margin-top: 8px;
+            padding: 6px 8px;
+            border: 1px solid rgba(255,255,255,0.2);
+            border-radius: 4px;
+            background: rgba(255,255,255,0.1);
+            color: #fff;
+            font-size: 12px;
+            font-family: inherit;
+            resize: vertical;
+            outline: none;
+        }
+
+        #soundscape-prompt::placeholder {
+            color: rgba(255,255,255,0.4);
+        }
+
+        #soundscape-set {
+            margin-top: 6px;
+            padding: 4px 12px;
+            border: 1px solid rgba(255,255,255,0.3);
+            border-radius: 4px;
+            background: rgba(255,255,255,0.15);
+            color: #fff;
+            font-size: 12px;
+            cursor: pointer;
+        }
+
+        #soundscape-set:hover {
+            background: rgba(255,255,255,0.25);
+        }
     </style>
 </head>
 <body>
@@ -190,8 +259,20 @@
     <div id="controls">
         <label>
             <input type="checkbox" id="audio-enabled" />
-            Enable Audio
+            Rain Sounds
         </label>
+        <div class="control-divider"></div>
+        <label>
+            <input type="checkbox" id="soundscape-enabled" />
+            AI Soundscape
+        </label>
+        <div id="soundscape-config" style="display: none;">
+            <input type="password" id="api-key" placeholder="Gemini API key" />
+            <span id="soundscape-status"></span>
+            <textarea id="soundscape-prompt" rows="2" placeholder="Describe the soundscape..."></textarea>
+            <button id="soundscape-set">Set</button>
+        </div>
+        <div class="control-divider"></div>
         <div id="activity-level">Activity: <span id="activity-value">0%</span></div>
     </div>
 
